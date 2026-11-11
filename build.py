@@ -98,6 +98,9 @@ def fetch(url, headers=None, limit=None, timeout=TIMEOUT):
 # ---------------------------------------------------------------- playlist
 
 ATTR = re.compile(r'([\w-]+)="([^"]*)"')
+# Name is after the first comma that is NOT inside a "quoted" value
+# (user-agent values contain commas, e.g. "KHTML, like Gecko").
+EXTINF = re.compile(r'^(#EXTINF:[^,"]*(?:"[^"]*"[^,"]*)*),(.*)$')
 
 
 def parse_m3u(text):
@@ -105,7 +108,8 @@ def parse_m3u(text):
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#EXTINF"):
-            head, _, name = line.partition(",")
+            m = EXTINF.match(line)
+            head, name = m.groups() if m else (line, "")
             cur = {"attrs": dict(ATTR.findall(head)), "name": name.strip(),
                    "opts": []}
         elif line.startswith("#EXTVLCOPT") and cur:
@@ -289,7 +293,6 @@ def build_guide(chans):
         except ET.ParseError:
             log(f"  skipped (bad file): {g}")
             continue
-        src = re.sub(r"\W", "", urllib.parse.urlparse(g).path)[-20:]
         ids = {}
         for ch in root.findall("channel"):
             names = [d.text or "" for d in ch.findall("display-name")]
@@ -297,7 +300,11 @@ def build_guide(chans):
                 for c in wanted.get(norm(nm), []):
                     if id(c) in matched:
                         continue
-                    new_id = f"{src}.{ch.get('id')}"
+                    # Plain id (letters/digits/dots only): some TV apps fail
+                    # to read ids with spaces or symbols.
+                    new_id = ids.get(ch.get("id")) or "{}.g{}".format(
+                        re.sub(r"[^A-Za-z0-9]", "", ch.get("id"))[:40] or "ch",
+                        len(matched) + 1)
                     matched[id(c)] = new_id
                     c["guide_id"] = new_id
                     ids[ch.get("id")] = new_id
@@ -312,24 +319,59 @@ def build_guide(chans):
                 out_prog.append(p)
         log(f"  {len(out_ch) - n_before:4d} channels matched from {g}")
 
-    tv = ET.Element("tv", {"generator-info-name": "iptv-clean"})
+    # Channel names as they appear in the playlist (clean, without "(720p)").
+    show_name = {}
+    for c in chans:
+        if c.get("guide_id"):
+            show_name.setdefault(c["guide_id"],
+                                 re.sub(r"\s*[\(\[].*?[\)\]]", "", c["name"]).strip())
+
+    keep_tags = {"title", "sub-title", "desc", "category", "icon",
+                 "episode-num", "date", "rating"}
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<!DOCTYPE tv SYSTEM "xmltv.dtd">',
+             '<tv generator-info-name="iptv-clean">']
     seen = set()
     for ch in out_ch:
-        if ch.get("id") not in seen:
-            tv.append(ch)
-            seen.add(ch.get("id"))
-    tv.extend(out_prog)
-    buf = io.BytesIO()
-    ET.ElementTree(tv).write(buf, encoding="utf-8", xml_declaration=True)
+        cid = ch.get("id")
+        if cid in seen:
+            continue
+        seen.add(cid)
+        new = ET.Element("channel", {"id": cid})
+        ET.SubElement(new, "display-name").text = show_name.get(cid, cid)
+        icon = ch.find("icon")
+        if icon is not None and icon.get("src"):
+            ET.SubElement(new, "icon", {"src": icon.get("src")})
+        parts.append(ET.tostring(new, encoding="unicode"))
+    out_prog.sort(key=lambda p: (p.get("channel"), p.get("start", "")))
+    for p in out_prog:
+        if not (p.get("start") and p.get("stop")):
+            continue
+        new = ET.Element("programme", {"start": p.get("start"),
+                                       "stop": p.get("stop"),
+                                       "channel": p.get("channel")})
+        for child in p:
+            if child.tag in keep_tags:
+                new.append(child)
+        new.tail = None
+        for child in new:
+            child.tail = None
+        parts.append(ET.tostring(new, encoding="unicode"))
+    parts.append("</tv>")
+    data = ("\n".join(parts) + "\n").encode("utf-8")
+    ET.fromstring(data)                      # fail loudly if the file is broken
+    with open(os.path.join(OUT, "guide.xml"), "wb") as f:
+        f.write(data)
     with gzip.open(os.path.join(OUT, "guide.xml.gz"), "wb") as f:
-        f.write(buf.getvalue())
+        f.write(data)
     return len(matched)
 
 
 # ---------------------------------------------------------------- output
 
 def write_playlist(chans):
-    guide = f"{SITE_URL}/guide.xml.gz" if SITE_URL else "guide.xml.gz"
+    # Plain (not zipped) guide: a few TV apps can't read the .gz version.
+    guide = f"{SITE_URL}/guide.xml" if SITE_URL else "guide.xml"
     order = ["Hindi", "Regional", "English News", "English Movies",
              "English Entertainment", "Kids", "Documentary"]
 

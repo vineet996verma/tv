@@ -22,7 +22,7 @@ GitHub rebuilds the list every morning at 6 AM India time and serves it at a fix
 Your addresses (replace `USERNAME` and `tv`):
 
 - Playlist: `https://USERNAME.github.io/tv/playlist.m3u`
-- Guide: `https://USERNAME.github.io/tv/guide.xml.gz`
+- Guide: `https://USERNAME.github.io/tv/guide.xml` (a zipped copy, `guide.xml.gz`, is also there)
 - Report: `https://USERNAME.github.io/tv/report.txt`
 
 ## On the TV

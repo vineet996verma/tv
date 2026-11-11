@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "30 0 * * *"     # every day at 6:00 AM India time
   workflow_dispatch:          # lets you run it by hand from the Actions tab
+  push:
+    branches: [main]          # rebuild whenever the code changes
 
 permissions:
   contents: read
