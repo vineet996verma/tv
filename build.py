@@ -148,6 +148,12 @@ INDIA_GROUPS = [
 ]
 
 
+# Hindi channels that iptv-org does not tag as Hindi (matched by name).
+HINDI_EXTRA = ["Zee Bihar Jharkhand", "Zee Punjab Haryana Himachal",
+               "India News Punjab/Himachal", "Manoranjan Prime",
+               "Manoranjan Movies"]
+
+
 def india_group(cats):
     for name, members in INDIA_GROUPS:
         if members & set(cats):
@@ -162,37 +168,51 @@ def select_channels():
     hindi_urls = {c["url"] for c in
                   parse_m3u(fetch(HINDI, timeout=60)[2].decode("utf-8", "replace"))}
 
+    hindi = parse_m3u(fetch(HINDI, timeout=60)[2].decode("utf-8", "replace"))
+    india_urls = {c["url"] for c in india}
+
     picked, seen = [], set()
-    for c in india:
-        cats = c["attrs"].get("group-title", "").split(";")
-        if DROP & set(cats) or c["url"] in seen:
-            continue
-        lang = "Hindi" if c["url"] in hindi_urls else "Regional"
-        c["group"] = f"{lang} {india_group(cats)}"
+
+    def add(c, group):
+        c["group"] = group
         picked.append(c)
         seen.add(c["url"])
+
+    # 1. Hindi channels, from any country (also catches extra feeds such as
+    #    "Zee Cinema APAC" that are not in the India list).
+    for c in hindi:
+        cats = c["attrs"].get("group-title", "").split(";")
+        if not (DROP & set(cats)) and c["url"] not in seen:
+            add(c, f"Hindi {india_group(cats)}")
+    # 2. Indian channels that are Hindi but not tagged as Hindi by iptv-org.
+    for c in india:
+        if c["url"] not in seen and any(
+                n.lower() in c["name"].lower() for n in HINDI_EXTRA):
+            add(c, f"Hindi {india_group(c['attrs'].get('group-title', '').split(';'))}")
+    # 3. English channels. Indian English channels (NDTV 24x7, India Today,
+    #    CNBC TV18...) are kept whatever their category.
     for c in eng:
         cats = c["attrs"].get("group-title", "").split(";")
         if DROP & set(cats) or c["url"] in seen:
             continue
         group = next((ENGLISH_KEEP[x] for x in cats if x in ENGLISH_KEEP), None)
-        if not group:
-            continue
-        c["group"] = group
-        picked.append(c)
-        seen.add(c["url"])
-    log(f"  {len(india)} Indian + {len(eng)} English in the source lists, "
+        if c["url"] in india_urls and not group:
+            group = "English Entertainment"
+        if group:
+            add(c, group)
+    # Everything else (Tamil, Telugu, Bangla, Marathi, Punjabi...) is left out.
+    log(f"  {len(hindi)} Hindi + {len(eng)} English in the source lists, "
         f"{len(picked)} match what we want")
     return picked
 
 
 # ---------------------------------------------------------------- testing
 
-def check(ch):
+def check(ch, timeout=TIMEOUT):
     """Return 'ok', 'blocked' (403 - maybe only blocked outside India) or 'dead'."""
     h = headers_for(ch)
     url = ch["url"]
-    status, final, body = fetch(url, h, limit=200_000)
+    status, final, body = fetch(url, h, limit=200_000, timeout=timeout)
     if status in (401, 403, 451):
         return "blocked"
     if status != 200:
@@ -209,7 +229,7 @@ def check(ch):
         if not variant:
             return "dead"
         status, final, body = fetch(urllib.parse.urljoin(final, variant), h,
-                                    limit=200_000)
+                                    limit=200_000, timeout=timeout)
         if status in (401, 403, 451):
             return "blocked"
         if status != 200:
@@ -220,7 +240,7 @@ def check(ch):
     if not segs:
         return "dead"
     # Make sure a video segment actually downloads.
-    status, _, seg = fetch(urllib.parse.urljoin(final, segs[-1]), h, limit=4096)
+    status, _, seg = fetch(urllib.parse.urljoin(final, segs[-1]), h, limit=4096, timeout=timeout)
     if status in (401, 403, 451):
         return "blocked"
     return "ok" if status in (200, 206) and seg else "dead"
@@ -238,6 +258,18 @@ def test_all(chans, keep_blocked):
                 results[futs[f]] = "dead"
             if n % 200 == 0:
                 log(f"  {n}/{len(chans)}")
+    # Second chance: slow or busy servers often fail once and then work.
+    retry = [i for i, r in results.items() if r == "dead"]
+    log(f"Re-testing {len(retry)} failed streams with a longer wait...")
+    with cf.ThreadPoolExecutor(max_workers=32) as pool:
+        futs = {pool.submit(check, chans[i], 30): i for i in retry}
+        for f in cf.as_completed(futs):
+            try:
+                results[futs[f]] = f.result()
+            except Exception:
+                pass
+    revived = sum(1 for i in retry if results[i] != "dead")
+    log(f"  {revived} came back on the second try")
     ok = [c for i, c in enumerate(chans)
           if results[i] == "ok" or (keep_blocked and results[i] == "blocked")]
     counts = {k: list(results.values()).count(k) for k in ("ok", "blocked", "dead")}
